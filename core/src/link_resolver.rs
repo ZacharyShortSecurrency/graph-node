@@ -49,13 +49,13 @@ fn retry_policy<I: Send + Sync>(
 /// case multiple clients respond in a timely manner. In addition, we may make
 /// good use of the stat returned.
 async fn select_fastest_client_with_stat(
-    clients: Arc<Vec<IpfsClient>>,
+    clients: Arc<Vec<Arc<IpfsClient>>>,
     logger: Logger,
     api: StatApi,
     path: String,
     timeout: Duration,
     do_retry: bool,
-) -> Result<(u64, IpfsClient), Error> {
+) -> Result<(u64, Arc<IpfsClient>), Error> {
     let mut err: Option<Error> = None;
 
     let mut stats: FuturesUnordered<_> = clients
@@ -108,7 +108,7 @@ fn restrict_file_size(path: &str, size: u64, max_file_bytes: usize) -> Result<()
 
 #[derive(Clone)]
 pub struct LinkResolver {
-    clients: Arc<Vec<IpfsClient>>,
+    clients: Arc<Vec<Arc<IpfsClient>>>,
     cache: Arc<Mutex<LruCache<String, Vec<u8>>>>,
     timeout: Duration,
     retry: bool,
@@ -118,7 +118,7 @@ pub struct LinkResolver {
 impl LinkResolver {
     pub fn new(clients: Vec<IpfsClient>, env_vars: Arc<EnvVars>) -> Self {
         Self {
-            clients: Arc::new(clients.into_iter().collect()),
+            clients: Arc::new(clients.into_iter().map(Arc::new).collect()),
             cache: Arc::new(Mutex::new(LruCache::with_capacity(
                 env_vars.mappings.max_ipfs_cache_size as usize,
             ))),
@@ -170,10 +170,10 @@ impl LinkResolverTrait for LinkResolver {
         }
         trace!(logger, "IPFS cache miss"; "hash" => &path);
 
-        let (size, client) = select_fastest_client_with_stat(
+        let (_size, client) = select_fastest_client_with_stat(
             self.clients.cheap_clone(),
             logger.cheap_clone(),
-            StatApi::Files,
+            StatApi::Block,
             path.clone(),
             self.timeout,
             self.retry,
@@ -182,11 +182,11 @@ impl LinkResolverTrait for LinkResolver {
 
         let max_cache_file_size = self.env_vars.mappings.max_ipfs_cache_file_size;
         let max_file_size = self.env_vars.mappings.max_ipfs_file_bytes;
-        restrict_file_size(&path, size, max_file_size)?;
+        // restrict_file_size(&path, size, max_file_size)?;
 
         let req_path = path.clone();
         let timeout = self.timeout;
-        let data = retry_policy(self.retry, "ipfs.cat", logger)
+        let data = retry_policy(self.retry, "ipfs.cat", &logger)
             .run(move || {
                 let path = req_path.clone();
                 let client = client.clone();
@@ -201,7 +201,7 @@ impl LinkResolverTrait for LinkResolver {
         if data.len() <= max_cache_file_size {
             let mut cache = self.cache.lock().unwrap();
             if !cache.contains_key(&path) {
-                cache.insert(path.clone(), data.clone());
+                cache.insert(path.to_owned(), data.clone());
             }
         } else {
             debug!(logger, "File too large for cache";
@@ -229,7 +229,7 @@ impl LinkResolverTrait for LinkResolver {
         restrict_file_size(&link.link, size, max_file_size)?;
 
         let link = link.link.clone();
-        let data = retry_policy(self.retry, "ipfs.getBlock", logger)
+        let data = retry_policy(self.retry, "ipfs.getBlock", &logger)
             .run(move || {
                 let link = link.clone();
                 let client = client.clone();
@@ -247,18 +247,18 @@ impl LinkResolverTrait for LinkResolver {
         // Discard the `/ipfs/` prefix (if present) to get the hash.
         let path = link.link.trim_start_matches("/ipfs/");
 
-        let (size, client) = select_fastest_client_with_stat(
+        let (_size, client) = select_fastest_client_with_stat(
             self.clients.cheap_clone(),
             logger.cheap_clone(),
-            StatApi::Files,
+            StatApi::Block,
             path.to_string(),
             self.timeout,
             self.retry,
         )
         .await?;
 
-        let max_file_size = self.env_vars.mappings.max_ipfs_map_file_size;
-        restrict_file_size(path, size, max_file_size)?;
+        // let max_file_size = self.env_vars.mappings.max_ipfs_map_file_size;
+        // restrict_file_size(path, size, max_file_size)?;
 
         let mut stream = client.cat(path, None).await?.fuse().boxed().compat();
 
@@ -310,7 +310,7 @@ impl LinkResolverTrait for LinkResolver {
                         // run through the loop.
                         match try_ready!(stream.poll().map_err(|e| anyhow::anyhow!("{}", e))) {
                             Some(b) => buf.extend_from_slice(&b),
-                            None if !buf.is_empty() => buf.extend_from_slice(&[b'\n']),
+                            None if buf.len() > 0 => buf.extend_from_slice(&[b'\n']),
                             None => return Ok(Async::Ready(None)),
                         }
                     }
@@ -404,3 +404,4 @@ mod tests {
         );
     }
 }
+
